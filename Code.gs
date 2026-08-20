@@ -1,27 +1,11 @@
 const CEVGE_CONFIG = {
   membersSheet: "Membres",
   auditSheet: "Ratings_Current",
-  fideUrl: "https://ratings.fide.com/download/standard_rating_list.zip",
-  monthlyDay: 2,
+  cacheUrl: "https://raw.githubusercontent.com/SamuelLovesCoffee/cevge-rating-sync/main/data/cevge-ratings.csv",
+  monthlyDay: 3,
   monthlyHour: 6,
   timeZone: "Europe/Zurich",
 }
-
-const FIDE_FIELDS = [
-  ["fide_id", "ID Number"],
-  ["name", "Name"],
-  ["fed", "Fed"],
-  ["sex", "Sex"],
-  ["title", "Tit"],
-  ["w_title", "WTit"],
-  ["o_title", "OTit"],
-  ["foa", "FOA"],
-  ["standard", "SRtng"],
-  ["standard_games", "SGm"],
-  ["standard_k", "SK"],
-  ["birth_year", "B-day"],
-  ["flag", "Flag"],
-]
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -44,7 +28,7 @@ function installMonthlyTrigger() {
     .create()
 
   SpreadsheetApp.getActive().toast(
-    "Monthly FIDE update installed for the 2nd of each month.",
+    "Monthly FIDE update installed for the 3rd of each month.",
     "CEVGE Ratings",
     6
   )
@@ -90,9 +74,16 @@ function updateFideRatings() {
   const fseEloCol = findColumnOptional_(headers, ["ELO (FSE)", "FSE Elo"])
   const fseCodeCol = findColumnOptional_(headers, ["CODE", "FSE code", "Code FSE"])
 
-  const members = []
-  const wantedIds = new Set()
+  spreadsheet.toast(
+    "Loading the latest CEVGE FIDE cache from GitHub…",
+    "CEVGE Ratings",
+    5
+  )
 
+  const cache = loadRatingCache_()
+  const cacheById = cache.byId
+
+  const members = []
   for (let rowIndex = 1; rowIndex < values.length; rowIndex++) {
     const row = values[rowIndex]
     const name = cleanCell_(row[nameCol])
@@ -100,192 +91,117 @@ function updateFideRatings() {
 
     if (!name && !fideId) continue
 
-    const member = {
+    members.push({
       sheetRow: rowIndex + 1,
-      arrayRow: rowIndex,
       name,
       fideId,
       fseCode: fseCodeCol >= 0 ? cleanId_(row[fseCodeCol]) : "",
       historicalFse: fseEloCol >= 0 ? cleanCell_(row[fseEloCol]) : "",
-    }
-
-    members.push(member)
-    if (fideId) wantedIds.add(fideId)
+    })
   }
 
-  if (!wantedIds.size) {
-    throw new Error("No FIDE IDs were found in the Membres sheet.")
-  }
-
-  spreadsheet.toast(
-    `Downloading the FIDE Standard list for ${wantedIds.size} member IDs…`,
-    "CEVGE Ratings",
-    5
-  )
-
-  const response = UrlFetchApp.fetch(CEVGE_CONFIG.fideUrl, {
-    muteHttpExceptions: true,
-    followRedirects: true,
-    headers: {
-      "User-Agent": "CEVGE-rating-sync/2.0 (https://www.cevge.com/)",
-    },
-  })
-
-  const status = response.getResponseCode()
-  if (status < 200 || status >= 300) {
-    throw new Error(`FIDE download failed with HTTP ${status}.`)
-  }
-
-  const blobs = Utilities.unzip(response.getBlob())
-  if (!blobs.length) {
-    throw new Error("The FIDE ZIP archive was empty.")
-  }
-
-  const textBlob = blobs.find((blob) => /\.txt$/i.test(blob.getName())) || blobs[0]
-  const text = textBlob.getDataAsString("UTF-8")
-  const fide = parseFideStandardList_(text, wantedIds)
-
-  const existingEloRange = membersSheet.getRange(2, fideEloCol + 1, values.length - 1, 1)
-  const fideEloValues = existingEloRange.getValues()
+  const eloRange = membersSheet.getRange(2, fideEloCol + 1, values.length - 1, 1)
+  const eloValues = eloRange.getValues()
 
   let updatedCount = 0
-  let notFoundCount = 0
+  let missingCount = 0
 
   members.forEach((member) => {
     if (!member.fideId) return
 
-    const record = fide[member.fideId]
+    const record = cacheById[member.fideId]
     if (!record) {
-      notFoundCount++
+      missingCount++
       return
     }
 
-    const relativeIndex = member.sheetRow - 2
-    fideEloValues[relativeIndex][0] = record.standard || ""
-    updatedCount++
+    if (record.standard) {
+      eloValues[member.sheetRow - 2][0] = Number(record.standard)
+      updatedCount++
+    } else if (record.status === "FIDE unrated") {
+      eloValues[member.sheetRow - 2][0] = ""
+      updatedCount++
+    } else {
+      missingCount++
+    }
   })
 
-  existingEloRange.setValues(fideEloValues)
-  writeAuditSheet_(spreadsheet, members, fide)
-
-  const now = Utilities.formatDate(
-    new Date(),
-    CEVGE_CONFIG.timeZone,
-    "yyyy-MM-dd HH:mm:ss"
-  )
+  eloRange.setValues(eloValues)
+  writeAuditSheet_(spreadsheet, members, cache)
 
   spreadsheet.toast(
-    `Updated ${updatedCount} FIDE ratings${notFoundCount ? `; ${notFoundCount} IDs not found` : ""}.`,
+    `Updated ${updatedCount} FIDE ratings${missingCount ? `; ${missingCount} IDs need checking` : ""}.`,
     "CEVGE Ratings",
     8
   )
 
-  console.log(`FIDE rating sync complete at ${now}`)
-  console.log(`Members: ${members.length}`)
-  console.log(`Matched: ${updatedCount}/${wantedIds.size}`)
-
-  if (notFoundCount) {
-    const missing = members
-      .filter((member) => member.fideId && !fide[member.fideId])
-      .map((member) => `${member.name || "Unnamed"} (${member.fideId})`)
-
-    console.warn(`FIDE IDs not found: ${missing.join(", ")}`)
-  }
+  console.log(`Cache updated: ${cache.updatedAt || "unknown"}`)
+  console.log(`Matched/updated: ${updatedCount}`)
+  console.log(`Missing/needs checking: ${missingCount}`)
 }
 
-function parseFideStandardList_(text, wantedIds) {
-  const headerEnd = text.indexOf("\n")
-  if (headerEnd < 0) {
-    throw new Error("Could not read the FIDE list header.")
+function loadRatingCache_() {
+  const response = UrlFetchApp.fetch(CEVGE_CONFIG.cacheUrl, {
+    muteHttpExceptions: true,
+    followRedirects: true,
+  })
+
+  const status = response.getResponseCode()
+  if (status < 200 || status >= 300) {
+    throw new Error(
+      `Could not load the GitHub rating cache (HTTP ${status}). ` +
+      "Make sure the cevge-rating-sync repository is public and the cache workflow has run."
+    )
   }
 
-  const header = text.slice(0, headerEnd).replace(/\r$/, "")
-  const spans = fideFieldSpans_(header)
-  const results = {}
+  const rows = Utilities.parseCsv(response.getContentText("UTF-8"))
+  if (rows.length < 2) {
+    throw new Error("The GitHub rating cache is empty.")
+  }
 
-  const lineRegex = /[^\r\n]+/g
-  lineRegex.lastIndex = headerEnd + 1
+  const headers = rows[0]
+  const fideIdCol = findColumn_(headers, ["fide_id"])
+  const nameCol = findColumn_(headers, ["name"])
+  const federationCol = findColumn_(headers, ["federation"])
+  const titleCol = findColumn_(headers, ["title"])
+  const standardCol = findColumn_(headers, ["standard"])
+  const inactiveCol = findColumn_(headers, ["inactive"])
+  const statusCol = findColumn_(headers, ["status"])
+  const updatedCol = findColumn_(headers, ["updated_at_utc"])
+  const sourceCol = findColumn_(headers, ["source"])
 
-  let match
-  while ((match = lineRegex.exec(text)) !== null) {
-    const line = match[0]
-    const fideId = cleanId_(fideField_(line, spans, "fide_id"))
+  const byId = {}
+  let updatedAt = ""
 
-    if (!fideId || !wantedIds.has(fideId)) continue
+  rows.slice(1).forEach((row) => {
+    const fideId = cleanId_(row[fideIdCol])
+    if (!fideId) return
 
-    const ratingText = fideField_(line, spans, "standard")
-    const ratingMatch = ratingText.match(/\d+/)
-    const flag = fideField_(line, spans, "flag")
+    updatedAt = updatedAt || cleanCell_(row[updatedCol])
 
-    results[fideId] = {
+    byId[fideId] = {
       fideId,
-      name: fideField_(line, spans, "name"),
-      federation: fideField_(line, spans, "fed"),
-      title: fideField_(line, spans, "title").toUpperCase(),
-      standard: ratingMatch ? Number(ratingMatch[0]) : null,
-      inactive: /i/i.test(flag),
-      flag,
-    }
-
-    if (Object.keys(results).length === wantedIds.size) break
-  }
-
-  return results
-}
-
-function fideFieldSpans_(header) {
-  const lowerHeader = header.toLowerCase()
-  const positions = []
-
-  FIDE_FIELDS.forEach(([key, label]) => {
-    const position = lowerHeader.indexOf(label.toLowerCase())
-    if (position >= 0) positions.push({ key, position })
-  })
-
-  positions.sort((a, b) => a.position - b.position)
-
-  const keys = new Set(positions.map((item) => item.key))
-  if (!keys.has("fide_id") || !keys.has("name") || !keys.has("standard")) {
-    throw new Error(`Unexpected FIDE list format. Header: ${header}`)
-  }
-
-  const spans = {}
-  positions.forEach((item, index) => {
-    spans[item.key] = {
-      start: item.position,
-      end: index + 1 < positions.length ? positions[index + 1].position : null,
+      name: cleanCell_(row[nameCol]),
+      federation: cleanCell_(row[federationCol]),
+      title: cleanCell_(row[titleCol]),
+      standard: cleanCell_(row[standardCol]),
+      inactive: cleanCell_(row[inactiveCol]).toLowerCase() === "true",
+      status: cleanCell_(row[statusCol]),
+      source: cleanCell_(row[sourceCol]),
     }
   })
 
-  return spans
+  return { byId, updatedAt }
 }
 
-function fideField_(line, spans, key) {
-  const span = spans[key]
-  if (!span) return ""
-
-  return (
-    span.end === null
-      ? line.slice(span.start)
-      : line.slice(span.start, span.end)
-  ).trim()
-}
-
-function writeAuditSheet_(spreadsheet, members, fide) {
+function writeAuditSheet_(spreadsheet, members, cache) {
   let sheet = spreadsheet.getSheetByName(CEVGE_CONFIG.auditSheet)
-
   if (!sheet) {
     sheet = spreadsheet.insertSheet(CEVGE_CONFIG.auditSheet)
   }
 
-  const updatedAt = Utilities.formatDate(
-    new Date(),
-    CEVGE_CONFIG.timeZone,
-    "yyyy-MM-dd HH:mm:ss"
-  )
-
   const rows = [[
-    "updated_at",
+    "cache_updated_at_utc",
     "nom_complet",
     "fse_code",
     "fide_id",
@@ -300,26 +216,26 @@ function writeAuditSheet_(spreadsheet, members, fide) {
   ]]
 
   members.forEach((member) => {
-    const record = member.fideId ? fide[member.fideId] : null
+    const record = member.fideId ? cache.byId[member.fideId] : null
 
     let status = "OK"
     if (!member.fideId) status = "No FIDE ID"
-    else if (!record) status = "FIDE ID not found"
-    else if (!record.standard) status = "FIDE unrated"
+    else if (!record) status = "Not in cache"
+    else status = record.status || "OK"
 
     rows.push([
-      updatedAt,
+      cache.updatedAt,
       member.name,
       member.fseCode,
       member.fideId,
       record ? record.name : "",
       record ? record.federation : "",
       record ? record.title : "",
-      record ? record.standard || "" : "",
+      record ? record.standard : "",
       record ? record.inactive : "",
       member.historicalFse,
       status,
-      CEVGE_CONFIG.fideUrl,
+      record ? record.source : "",
     ])
   })
 
