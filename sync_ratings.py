@@ -11,9 +11,10 @@ from datetime import datetime, timezone
 import gspread
 import requests
 
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "19xK1KZMzmkHfq4wiw1WKbb1SfgEwIwUkaCx75zC4E3g")
-MEMBERS_TAB = os.getenv("MEMBERS_TAB", "Membres")
-RATINGS_TAB = os.getenv("RATINGS_TAB", "Ratings_Current")
+DEFAULT_SHEET_ID = "19xK1KZMzmkHfq4wiw1WKbb1SfgEwIwUkaCx75zC4E3g"
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip() or DEFAULT_SHEET_ID
+MEMBERS_TAB = os.getenv("MEMBERS_TAB", "").strip() or "Membres"
+RATINGS_TAB = os.getenv("RATINGS_TAB", "").strip() or "Ratings_Current"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
 
 FIDE_URL = "https://ratings.fide.com/download/players_list.zip"
@@ -64,8 +65,7 @@ def google_client():
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON GitHub secret")
-    info = json.loads(raw)
-    return gspread.service_account_from_dict(info)
+    return gspread.service_account_from_dict(json.loads(raw))
 
 
 def read_members(spreadsheet):
