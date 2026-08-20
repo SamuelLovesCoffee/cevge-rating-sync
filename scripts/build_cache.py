@@ -17,15 +17,20 @@ MEMBERS_TAB = os.getenv("MEMBERS_TAB", "Membres")
 
 # ratings.fide.com is currently unreachable from GitHub-hosted and Google
 # Apps Script infrastructure. This public mirror is generated from FIDE's
-# official rating download and split by federation. CEVGE members are SUI.
-MIRROR_URL = (
+# official monthly rating download and split by federation.
+#
+# Most CEVGE members are registered with SUI, but some (e.g. Julien Perrin)
+# retain another FIDE federation. Search both SUI and FRA rather than assuming
+# every club member appears in Switzerland's federation file.
+MIRROR_BASE = (
     "https://raw.githubusercontent.com/samuraitruong/"
-    "fide-ratings-utils/main/data/SUI/standard/standard.csv"
+    "fide-ratings-utils/main/data/{fed}/standard/standard.csv"
 )
+FEDERATIONS = ("SUI", "FRA")
 OFFICIAL_SOURCE = "https://ratings.fide.com/download_lists.phtml"
 
 OUTPUT = Path("data/cevge-ratings.csv")
-USER_AGENT = "CEVGE-rating-sync/3.1 (https://www.cevge.com/)"
+USER_AGENT = "CEVGE-rating-sync/3.2 (https://www.cevge.com/)"
 
 
 def fetch_bytes(url: str, timeout: int = 60) -> bytes:
@@ -80,18 +85,13 @@ def load_member_ids() -> set[str]:
     return ids
 
 
-def load_fide(wanted_ids: set[str]):
-    print("Downloading Swiss Standard rating mirror…")
-    payload = fetch_bytes(MIRROR_URL)
+def parse_mirror(payload: bytes, wanted_ids: set[str], mirror_url: str):
     text = payload.decode("utf-8-sig", errors="replace")
-    print(f"Downloaded {len(payload) / 1024:.1f} KB")
-
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
-        raise RuntimeError("Rating mirror has no CSV header")
+        raise RuntimeError(f"Rating mirror has no CSV header: {mirror_url}")
 
     header_map = {normalize_header(name): name for name in reader.fieldnames}
-
     id_key = header_map.get("id number")
     name_key = header_map.get("name")
     fed_key = header_map.get("fed")
@@ -129,16 +129,46 @@ def load_fide(wanted_ids: set[str]):
             "standard": standard,
             "inactive": "i" in str(flag).lower(),
             "rating_month": row.get(month_key, "") if month_key else "",
+            "mirror": mirror_url,
         }
 
-    if rating_months:
-        print("Mirror rating month(s): " + ", ".join(sorted(rating_months)))
+    return found, rating_months
 
-    print(f"Matched {len(found)}/{len(wanted_ids)} FIDE IDs")
+
+def load_fide(wanted_ids: set[str]):
+    found = {}
+    all_months = set()
+
+    for federation in FEDERATIONS:
+        remaining = wanted_ids.difference(found)
+        if not remaining:
+            break
+
+        mirror_url = MIRROR_BASE.format(fed=federation)
+        print(f"Downloading {federation} Standard rating mirror…")
+        payload = fetch_bytes(mirror_url)
+        print(f"Downloaded {len(payload) / 1024:.1f} KB")
+
+        federation_found, rating_months = parse_mirror(
+            payload,
+            remaining,
+            mirror_url,
+        )
+        found.update(federation_found)
+        all_months.update(rating_months)
+        print(f"Matched {len(federation_found)} additional member IDs in {federation}")
+
+    if all_months:
+        print("Mirror rating month(s): " + ", ".join(sorted(all_months)))
+
+    print(f"Matched {len(found)}/{len(wanted_ids)} FIDE IDs with published Standard ratings")
 
     missing = sorted(wanted_ids.difference(found), key=int)
     if missing:
-        print("WARNING: IDs not found in SUI mirror: " + ", ".join(missing))
+        print(
+            "INFO: IDs absent from current SUI/FRA Standard lists "
+            "(normally unrated): " + ", ".join(missing)
+        )
 
     return found
 
@@ -181,7 +211,7 @@ def write_cache(wanted_ids: set[str], found: dict):
                     "inactive": str(bool(record["inactive"])).lower(),
                     "status": "OK" if record["standard"] else "FIDE unrated",
                     "source": OFFICIAL_SOURCE,
-                    "mirror": MIRROR_URL,
+                    "mirror": record.get("mirror", ""),
                 })
             else:
                 writer.writerow({
@@ -193,9 +223,9 @@ def write_cache(wanted_ids: set[str], found: dict):
                     "title": "",
                     "standard": "",
                     "inactive": "",
-                    "status": "FIDE ID not found in SUI mirror",
+                    "status": "No published Standard rating",
                     "source": OFFICIAL_SOURCE,
-                    "mirror": MIRROR_URL,
+                    "mirror": " | ".join(MIRROR_BASE.format(fed=fed) for fed in FEDERATIONS),
                 })
 
     print(f"Wrote {OUTPUT}")
