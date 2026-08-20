@@ -6,7 +6,6 @@ import os
 import re
 import urllib.parse
 import urllib.request
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,12 +14,21 @@ SHEET_ID = os.getenv(
     "19xK1KZMzmkHfq4wiw1WKbb1SfgEwIwUkaCx75zC4E3g",
 )
 MEMBERS_TAB = os.getenv("MEMBERS_TAB", "Membres")
-FIDE_URL = "https://ratings.fide.com/download/standard_rating_list.zip"
+
+# ratings.fide.com is currently unreachable from GitHub-hosted and Google
+# Apps Script infrastructure. This public mirror is generated from FIDE's
+# official rating download and split by federation. CEVGE members are SUI.
+MIRROR_URL = (
+    "https://raw.githubusercontent.com/samuraitruong/"
+    "fide-ratings-utils/main/data/SUI/standard/standard.csv"
+)
+OFFICIAL_SOURCE = "https://ratings.fide.com/download_lists.phtml"
+
 OUTPUT = Path("data/cevge-ratings.csv")
-USER_AGENT = "CEVGE-rating-sync/3.0 (https://www.cevge.com/)"
+USER_AGENT = "CEVGE-rating-sync/3.1 (https://www.cevge.com/)"
 
 
-def fetch_bytes(url: str, timeout: int = 180) -> bytes:
+def fetch_bytes(url: str, timeout: int = 60) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
@@ -34,7 +42,11 @@ def clean_id(value: str) -> str:
 
 
 def normalize_header(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip().lower().replace("_", " "))
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or "").strip().lower().replace("_", " "),
+    )
 
 
 def find_column(headers, aliases):
@@ -48,8 +60,9 @@ def find_column(headers, aliases):
 def load_member_ids() -> set[str]:
     query = urllib.parse.urlencode({"tqx": "out:csv", "sheet": MEMBERS_TAB})
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?{query}"
-    text = fetch_bytes(url, timeout=60).decode("utf-8-sig")
+    text = fetch_bytes(url).decode("utf-8-sig")
     rows = list(csv.reader(io.StringIO(text)))
+
     if not rows:
         raise RuntimeError("Membres export was empty")
 
@@ -67,77 +80,15 @@ def load_member_ids() -> set[str]:
     return ids
 
 
-def fixed_width_positions(header: str):
-    labels = {
-        "id": "ID Number",
-        "name": "Name",
-        "fed": "Fed",
-        "sex": "Sex",
-        "title": "Tit",
-        "wtit": "WTit",
-        "otit": "OTit",
-        "foa": "FOA",
-        "gms": "Gms",
-        "bday": "B-day",
-        "flag": "Flag",
-    }
-    positions = {}
-    for key, label in labels.items():
-        pos = header.find(label)
-        if pos < 0:
-            raise RuntimeError(f"Unexpected FIDE header; missing {label!r}: {header!r}")
-        positions[key] = pos
-    return positions
+def load_fide(wanted_ids: set[str]):
+    print("Downloading Swiss Standard rating mirror…")
+    payload = fetch_bytes(MIRROR_URL)
+    text = payload.decode("utf-8-sig", errors="replace")
+    print(f"Downloaded {len(payload) / 1024:.1f} KB")
 
-
-def parse_fixed_width(text: str, wanted_ids: set[str]):
-    lines = text.splitlines()
-    if not lines:
-        raise RuntimeError("FIDE text file is empty")
-
-    header = lines[0]
-    pos = fixed_width_positions(header)
-    found = {}
-
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-
-        fide_id = clean_id(line[pos["id"]:pos["name"]])
-        if fide_id not in wanted_ids:
-            continue
-
-        name = line[pos["name"]:pos["fed"]].strip()
-        federation = line[pos["fed"]:pos["sex"]].strip()
-        title = line[pos["title"]:pos["wtit"]].strip()
-        rating_region = line[pos["foa"]:pos["gms"]]
-        rating_candidates = [
-            int(value)
-            for value in re.findall(r"\b\d{4}\b", rating_region)
-            if 1000 <= int(value) <= 3000
-        ]
-        standard = rating_candidates[-1] if rating_candidates else None
-        flag = line[pos["flag"]:].strip()
-
-        found[fide_id] = {
-            "fide_id": fide_id,
-            "name": name,
-            "federation": federation,
-            "title": title,
-            "standard": standard,
-            "inactive": "i" in flag.lower(),
-        }
-
-        if len(found) == len(wanted_ids):
-            break
-
-    return found
-
-
-def parse_csv_text(text: str, wanted_ids: set[str]):
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
-        raise RuntimeError("FIDE CSV has no header")
+        raise RuntimeError("Rating mirror has no CSV header")
 
     header_map = {normalize_header(name): name for name in reader.fieldnames}
 
@@ -145,15 +96,24 @@ def parse_csv_text(text: str, wanted_ids: set[str]):
     name_key = header_map.get("name")
     fed_key = header_map.get("fed")
     title_key = header_map.get("title") or header_map.get("tit")
-    rating_key = header_map.get("rating") or header_map.get("srtng")
+    rating_key = header_map.get("rating")
+    month_key = header_map.get("ratingmonth") or header_map.get("rating month")
     flag_key = header_map.get("flag")
 
     if not id_key or not rating_key:
-        raise RuntimeError(f"Unexpected FIDE CSV header: {reader.fieldnames}")
+        raise RuntimeError(f"Unexpected rating mirror header: {reader.fieldnames}")
 
     found = {}
+    rating_months = set()
+
     for row in reader:
         fide_id = clean_id(row.get(id_key, ""))
+        if not fide_id:
+            continue
+
+        if month_key and row.get(month_key):
+            rating_months.add(str(row[month_key]).strip())
+
         if fide_id not in wanted_ids:
             continue
 
@@ -168,34 +128,18 @@ def parse_csv_text(text: str, wanted_ids: set[str]):
             "title": row.get(title_key, "") if title_key else "",
             "standard": standard,
             "inactive": "i" in str(flag).lower(),
+            "rating_month": row.get(month_key, "") if month_key else "",
         }
 
-    return found
-
-
-def load_fide(wanted_ids: set[str]):
-    print("Downloading official FIDE Standard rating list…")
-    payload = fetch_bytes(FIDE_URL)
-    print(f"Downloaded {len(payload) / 1024 / 1024:.1f} MB")
-
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-        candidates = [
-            name for name in archive.namelist()
-            if name.lower().endswith((".txt", ".csv")) and not name.endswith("/")
-        ]
-        if not candidates:
-            raise RuntimeError("FIDE ZIP contained no TXT or CSV file")
-
-        filename = max(candidates, key=lambda name: archive.getinfo(name).file_size)
-        text = archive.read(filename).decode("utf-8-sig", errors="replace")
-
-    first_line = text.splitlines()[0] if text.splitlines() else ""
-    if "," in first_line and "ID Number" in first_line:
-        found = parse_csv_text(text, wanted_ids)
-    else:
-        found = parse_fixed_width(text, wanted_ids)
+    if rating_months:
+        print("Mirror rating month(s): " + ", ".join(sorted(rating_months)))
 
     print(f"Matched {len(found)}/{len(wanted_ids)} FIDE IDs")
+
+    missing = sorted(wanted_ids.difference(found), key=int)
+    if missing:
+        print("WARNING: IDs not found in SUI mirror: " + ", ".join(missing))
+
     return found
 
 
@@ -208,6 +152,7 @@ def write_cache(wanted_ids: set[str], found: dict):
             handle,
             fieldnames=[
                 "updated_at_utc",
+                "rating_month",
                 "fide_id",
                 "name",
                 "federation",
@@ -216,15 +161,18 @@ def write_cache(wanted_ids: set[str], found: dict):
                 "inactive",
                 "status",
                 "source",
+                "mirror",
             ],
         )
         writer.writeheader()
 
-        for fide_id in sorted(wanted_ids, key=lambda value: int(value)):
+        for fide_id in sorted(wanted_ids, key=int):
             record = found.get(fide_id)
+
             if record:
                 writer.writerow({
                     "updated_at_utc": updated_at,
+                    "rating_month": record.get("rating_month", ""),
                     "fide_id": fide_id,
                     "name": record["name"],
                     "federation": record["federation"],
@@ -232,19 +180,22 @@ def write_cache(wanted_ids: set[str], found: dict):
                     "standard": record["standard"] or "",
                     "inactive": str(bool(record["inactive"])).lower(),
                     "status": "OK" if record["standard"] else "FIDE unrated",
-                    "source": FIDE_URL,
+                    "source": OFFICIAL_SOURCE,
+                    "mirror": MIRROR_URL,
                 })
             else:
                 writer.writerow({
                     "updated_at_utc": updated_at,
+                    "rating_month": "",
                     "fide_id": fide_id,
                     "name": "",
                     "federation": "",
                     "title": "",
                     "standard": "",
                     "inactive": "",
-                    "status": "FIDE ID not found",
-                    "source": FIDE_URL,
+                    "status": "FIDE ID not found in SUI mirror",
+                    "source": OFFICIAL_SOURCE,
+                    "mirror": MIRROR_URL,
                 })
 
     print(f"Wrote {OUTPUT}")
