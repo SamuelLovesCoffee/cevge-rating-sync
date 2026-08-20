@@ -118,7 +118,10 @@ function updateFideRatings() {
     if (record.standard) {
       eloValues[member.sheetRow - 2][0] = Number(record.standard)
       updatedCount++
-    } else if (record.status === "FIDE unrated") {
+    } else if (
+      record.status === "FIDE unrated" ||
+      record.status === "No published Standard rating"
+    ) {
       eloValues[member.sheetRow - 2][0] = ""
       updatedCount++
     } else {
